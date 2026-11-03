@@ -1,0 +1,5 @@
+读写操作略。
+
+在TaskManagerInner下增加字段记录每个程序对应各种syscall的个数。
+
+在处理syscall的函数中调用增加函数，在systrace内部获取调用次数。exit后清空对应程序的调用次数。

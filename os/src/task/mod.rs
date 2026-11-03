@@ -19,6 +19,7 @@ use crate::loader::{get_num_app, init_app_cx};
 use crate::sync::UPSafeCell;
 use lazy_static::*;
 use switch::__switch;
+use crate::syscall::{SYSCALL_EXIT, SYSCALL_TRACE, SYSCALL_WRITE, SYSCALL_YIELD, SYSCALL_GET_TIME};
 pub use task::{TaskControlBlock, TaskStatus};
 
 pub use context::TaskContext;
@@ -39,12 +40,14 @@ pub struct TaskManager {
     inner: UPSafeCell<TaskManagerInner>,
 }
 
+const SYSCALL_NUM : usize = 8;
 /// Inner of Task Manager
 pub struct TaskManagerInner {
     /// task list
     tasks: [TaskControlBlock; MAX_APP_NUM],
     /// id of current `Running` task
     current_task: usize,
+    syscalls : [[isize;SYSCALL_NUM];MAX_APP_NUM],
 }
 
 lazy_static! {
@@ -65,6 +68,7 @@ lazy_static! {
                 UPSafeCell::new(TaskManagerInner {
                     tasks,
                     current_task: 0,
+                    syscalls: [[0isize;SYSCALL_NUM];MAX_APP_NUM],
                 })
             },
         }
@@ -135,6 +139,38 @@ impl TaskManager {
             panic!("All applications completed!");
         }
     }
+    pub(crate) fn trace_current_syscall(&self, syscall_id : usize) {
+        let mut inner = self.inner.exclusive_access();
+        let cur = inner.current_task;
+        match syscall_id {
+            SYSCALL_WRITE => inner.syscalls[cur][0] += 1,
+            SYSCALL_EXIT => inner.syscalls[cur][1] += 1,
+            SYSCALL_YIELD => inner.syscalls[cur][2] += 1,
+            SYSCALL_GET_TIME => inner.syscalls[cur][3] += 1,
+            SYSCALL_TRACE => inner.syscalls[cur][4] += 1,
+            _ => panic!("Unsupported syscall_id: {}", syscall_id),
+        };
+        drop(inner);
+    }
+    pub(crate) fn get_current_syscall(&self, syscall_id : usize) -> isize{
+        let inner = self.inner.exclusive_access();
+        let cur = inner.current_task;
+        let res = match syscall_id {
+            SYSCALL_WRITE => inner.syscalls[cur][0],
+            SYSCALL_EXIT => inner.syscalls[cur][1],
+            SYSCALL_YIELD => inner.syscalls[cur][2],
+            SYSCALL_GET_TIME => inner.syscalls[cur][3],
+            SYSCALL_TRACE => inner.syscalls[cur][4],
+            _ => -1,
+        };
+        drop(inner);
+        res
+    }
+    fn clear_current_syscall(&self){
+        let mut inner = self.inner.exclusive_access();
+        let cur = inner.current_task;
+        inner.syscalls[cur].fill(0);
+    }
 }
 
 /// Run the first task in task list.
@@ -167,5 +203,6 @@ pub fn suspend_current_and_run_next() {
 /// Exit the current 'Running' task and run the next task in task list.
 pub fn exit_current_and_run_next() {
     mark_current_exited();
+    TASK_MANAGER.clear_current_syscall();
     run_next_task();
 }
