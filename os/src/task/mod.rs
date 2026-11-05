@@ -15,6 +15,7 @@ mod switch;
 mod task;
 
 use crate::loader::{get_app_data, get_num_app};
+use crate::mm::*;
 use crate::sync::UPSafeCell;
 use crate::trap::TrapContext;
 use alloc::vec::Vec;
@@ -24,6 +25,9 @@ pub use task::{TaskControlBlock, TaskStatus};
 
 pub use context::TaskContext;
 
+pub use crate::syscall::{SYSCALL_WRITE, SYSCALL_EXIT, SYSCALL_YIELD, SYSCALL_GET_TIME, SYSCALL_SBRK, SYSCALL_MUNMAP, SYSCALL_MMAP, SYSCALL_TRACE};
+
+pub use crate::mm::translated_byte_buffer;
 /// The task manager, where all the tasks are managed.
 ///
 /// Functions implemented on `TaskManager` deals with all task state transitions
@@ -115,7 +119,7 @@ impl TaskManager {
     }
 
     /// Get the current 'Running' task's token.
-    fn get_current_token(&self) -> usize {
+    pub fn get_current_token(&self) -> usize {
         let inner = self.inner.exclusive_access();
         inner.tasks[inner.current_task].get_user_token()
     }
@@ -151,6 +155,108 @@ impl TaskManager {
             // go back to user mode
         } else {
             panic!("All applications completed!");
+        }
+    }
+    pub(crate) fn trace_current_syscall(&self, syscall_id : usize) {
+        let mut inner = self.inner.exclusive_access();
+        let cur = inner.current_task;
+        let cur_sys =&mut inner.tasks[cur].syscalls;
+        match syscall_id {
+            SYSCALL_WRITE => cur_sys[0] += 1,
+            SYSCALL_EXIT => cur_sys[1] += 1,
+            SYSCALL_YIELD => cur_sys[2] += 1,
+            SYSCALL_GET_TIME => cur_sys[3] += 1,
+            SYSCALL_SBRK => cur_sys[4] += 1,
+            SYSCALL_MUNMAP => cur_sys[5] += 1,
+            SYSCALL_MMAP => cur_sys[6] += 1,
+            SYSCALL_TRACE => cur_sys[7] += 1,
+            _ => panic!("Unsupported syscall_id: {}", syscall_id),
+        };
+        drop(inner);
+    }
+    pub(crate) fn get_current_syscall(&self, syscall_id : usize) -> isize{
+        let inner = self.inner.exclusive_access();
+        let cur = inner.current_task;
+        let cur_sys = &inner.tasks[cur].syscalls;
+        let res = match syscall_id {
+            SYSCALL_WRITE => cur_sys[0],
+            SYSCALL_EXIT => cur_sys[1],
+            SYSCALL_YIELD => cur_sys[2],
+            SYSCALL_GET_TIME => cur_sys[3],
+            SYSCALL_SBRK => cur_sys[4],
+            SYSCALL_MUNMAP => cur_sys[5],
+            SYSCALL_MMAP => cur_sys[6],
+            SYSCALL_TRACE => cur_sys[7],
+            _ => -1,
+        };
+        drop(inner);
+        res
+    }
+    pub(crate) fn get_buf(&self, ptr: *const u8, len: usize) -> Vec<&'static mut [u8]>{
+        translated_byte_buffer(self.get_current_token(), ptr, len)
+    }
+    pub(crate) fn addto_current_memoryset(&self, start_va: VirtAddr,end_va: VirtAddr, permission: MapPermission){
+        let mut inner = self.inner.exclusive_access();
+        let cur = inner.current_task;
+        inner.tasks[cur].memory_set.insert_framed_area(start_va, end_va, permission);
+    }
+    pub(crate) fn erase_from_current_memoryset(&self, start_va: VirtAddr, end_va: VirtAddr){
+        let mut inner = self.inner.exclusive_access();
+        let cur = inner.current_task;
+        let memory_set = &mut inner.tasks[cur].memory_set;
+        let area = &mut memory_set.areas;
+        let pgtable = &mut memory_set.page_table;
+        let mut i = 0;
+        while i < area.len() {
+            let l = area[i].vpn_range.get_start();
+            let r = area[i].vpn_range.get_end();
+            if l >= end_va.ceil() || r <= start_va.floor(){
+                i += 1;
+                continue;
+            }
+            if l < start_va.floor() && r > end_va.ceil() {
+                for x in area[i].vpn_range{
+                    if x < start_va.floor() {
+                        continue;
+                    }else if x < end_va.ceil() {
+                        area[i].unmap_one(pgtable, x);
+                    }else {
+                        break;
+                    }
+                }
+                let vrange1 = VPNRange::new(l, start_va.floor());
+                area[i].vpn_range = vrange1;
+                let perm = area[i].map_perm;
+                let frames = area[i].data_frames.split_off(&end_va.ceil());
+                let vrange2 = VPNRange::new(end_va.ceil(), r);
+                let newarea = MapArea{vpn_range : vrange2,data_frames : frames,map_type : MapType::Framed,map_perm : perm};
+                area.push(newarea);
+                return ;
+            }else if l >= start_va.floor() && r <= end_va.ceil(){
+                area[i].unmap(pgtable);
+                area.remove(i);
+                continue;
+            }else {
+                if r > end_va.ceil(){
+                    for x in area[i].vpn_range {
+                        if x < end_va.ceil() {
+                            area[i].unmap_one(pgtable, x);
+                        }
+                        else{
+                            break;
+                        }
+                    }
+                    let vrange = VPNRange::new(end_va.ceil(), r);
+                    area[i].vpn_range = vrange;
+                    i += 1;
+                    continue;
+                }
+                if l < start_va.floor(){
+                    area[i].shrink_to(pgtable, start_va.ceil());
+                    i += 1;
+                    continue;
+                }
+            }
         }
     }
 }
