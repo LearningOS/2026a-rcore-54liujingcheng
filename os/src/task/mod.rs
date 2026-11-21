@@ -20,14 +20,16 @@ mod processor;
 mod switch;
 #[allow(clippy::module_inception)]
 mod task;
-
-use crate::loader::get_app_data_by_name;
-use alloc::sync::Arc;
-use lazy_static::*;
-pub use manager::{fetch_task, TaskManager};
-use switch::__switch;
+use alloc::vec::Vec;
+pub use crate::loader::get_app_data_by_name;
+pub use alloc::sync::Arc;
+pub use lazy_static::*;
+pub use manager::{fetch_task, TaskManager, TASK_MANAGER};
+pub use switch::__switch;
 pub use task::{TaskControlBlock, TaskStatus};
+pub use crate::syscall::{SYSCALL_WRITE, SYSCALL_EXIT, SYSCALL_YIELD, SYSCALL_GET_TIME, SYSCALL_SBRK, SYSCALL_MUNMAP, SYSCALL_MMAP};
 
+pub use crate::mm::{translated_byte_buffer, VirtAddr, MapPermission, MapArea, MapType, VPNRange};
 pub use context::TaskContext;
 pub use id::{kstack_alloc, pid_alloc, KernelStack, PidHandle};
 pub use manager::add_task;
@@ -100,7 +102,73 @@ pub fn exit_current_and_run_next(exit_code: i32) {
     let mut _unused = TaskContext::zero_init();
     schedule(&mut _unused as *mut _);
 }
-
+pub(crate) fn get_current_buf(ptr: *const u8, len: usize) -> Vec<&'static mut [u8]>{
+    translated_byte_buffer(current_user_token(), ptr, len)
+}
+pub(crate) fn addto_current_memoryset(start_va: VirtAddr,end_va: VirtAddr, permission: MapPermission){
+    let task = current_task().unwrap();
+    let mut inner = task.inner_exclusive_access();
+    inner.memory_set.insert_framed_area(start_va, end_va, permission);
+}
+pub(crate) fn erase_from_current_memoryset(start_va: VirtAddr, end_va: VirtAddr){
+    let task = current_task().unwrap();
+    let mut inner = task.inner_exclusive_access();
+    let memory_set = &mut inner.memory_set;
+    let area = &mut memory_set.areas;
+    let pgtable = &mut memory_set.page_table;
+    let mut i = 0;
+    while i < area.len() {
+        let l = area[i].vpn_range.get_start();
+        let r = area[i].vpn_range.get_end();
+        if l >= end_va.ceil() || r <= start_va.floor(){
+            i += 1;
+            continue;
+        }
+        if l < start_va.floor() && r > end_va.ceil() {
+            for x in area[i].vpn_range{
+                if x < start_va.floor() {
+                    continue;
+                }else if x < end_va.ceil() {
+                    area[i].unmap_one(pgtable, x);
+                }else {
+                    break;
+                }
+            }
+            let vrange1 = VPNRange::new(l, start_va.floor());
+            area[i].vpn_range = vrange1;
+            let perm = area[i].map_perm;
+            let frames = area[i].data_frames.split_off(&end_va.ceil());
+            let vrange2 = VPNRange::new(end_va.ceil(), r);
+            let newarea = MapArea{vpn_range : vrange2,data_frames : frames,map_type : MapType::Framed,map_perm : perm};
+            area.push(newarea);
+            return ;
+        }else if l >= start_va.floor() && r <= end_va.ceil(){
+            area[i].unmap(pgtable);
+            area.remove(i);
+            continue;
+        }else {
+            if r > end_va.ceil(){
+                for x in area[i].vpn_range {
+                    if x < end_va.ceil() {
+                        area[i].unmap_one(pgtable, x);
+                    }
+                    else{
+                        break;
+                    }
+                }
+                let vrange = VPNRange::new(end_va.ceil(), r);
+                area[i].vpn_range = vrange;
+                i += 1;
+                continue;
+            }
+            if l < start_va.floor(){
+                area[i].shrink_to(pgtable, start_va.ceil());
+                i += 1;
+                continue;
+            }
+        }
+    }
+}
 lazy_static! {
     /// Creation of initial process
     ///

@@ -5,9 +5,14 @@ use crate::{
     loader::get_app_data_by_name,
     mm::{translated_refmut, translated_str},
     task::{
-        add_task, current_task, current_user_token, exit_current_and_run_next,
-        suspend_current_and_run_next,
+        add_task, addto_current_memoryset, current_task, current_user_token, erase_from_current_memoryset, exit_current_and_run_next, get_current_buf, suspend_current_and_run_next, TaskControlBlock 
     },
+    timer::get_time_us,
+};
+
+use crate::{
+    config::PAGE_SIZE,
+    mm::{MapPermission, PageTable, VirtAddr},
 };
 
 #[repr(C)]
@@ -106,29 +111,77 @@ pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32) -> isize {
 /// HINT: You might reimplement it with virtual memory management.
 /// HINT: What if [`TimeVal`] is splitted by two pages ?
 pub fn sys_get_time(_ts: *mut TimeVal, _tz: usize) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_get_time NOT IMPLEMENTED",
-        current_task().unwrap().pid.0
-    );
-    -1
+    trace!("kernel: sys_get_time");
+    let us = get_time_us();
+    let tmp = TimeVal {
+        sec: us / 1_000_000,
+        usec: us % 1_000_000,
+    };
+    unsafe{
+        let mut _vec = get_current_buf(_ts as *const u8, 16);
+        if _vec.len() == 1 {
+            _vec[0].as_mut_ptr().copy_from(&tmp as *const TimeVal as *const u8, 16);
+        }else {
+            _vec[0].as_mut_ptr().copy_from(&(tmp.sec) as *const usize as *const u8, 8);
+            _vec[1].as_mut_ptr().copy_from(&(tmp.usec) as *const usize as *const u8, 8);
+        }
+    }
+    0
 }
 
 /// YOUR JOB: Implement mmap.
-pub fn sys_mmap(_start: usize, _len: usize, _port: usize) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_mmap NOT IMPLEMENTED",
-        current_task().unwrap().pid.0
-    );
-    -1
+pub fn sys_mmap(_start: usize, _len: usize, _prot: usize) -> isize {
+    trace!("kernel: sys_mmap NOT IMPLEMENTED YET!");
+    if _start % PAGE_SIZE != 0 || _prot & !0x7 != 0 || _prot & 0x7 == 0{
+        return -1;
+    }
+    let mut curvad = _start;
+    let _end = _start + ((_len + PAGE_SIZE - 1) & !(PAGE_SIZE-1));
+    while curvad < _end{
+        let pte = PageTable::from_token(current_user_token()).translate(VirtAddr::from(curvad).floor());
+        if let Option::Some(_pte) = pte{
+            if _pte.is_valid() {
+                return -1;
+            }
+        }
+        curvad += PAGE_SIZE;
+    }
+    let mut mp = MapPermission::empty();
+    mp |= MapPermission::U;
+    if _prot & 1 != 0 {
+        mp |= MapPermission::R;
+    }
+    if (_prot >> 1) & 1 != 0 {
+        mp |= MapPermission::W;
+    }
+    if (_prot >> 2) & 1 != 0 {
+        mp |= MapPermission::X;
+    }
+    addto_current_memoryset(VirtAddr::from(_start), VirtAddr::from(_end), mp);
+    0
 }
 
 /// YOUR JOB: Implement munmap.
 pub fn sys_munmap(_start: usize, _len: usize) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_munmap NOT IMPLEMENTED",
-        current_task().unwrap().pid.0
-    );
-    -1
+    trace!("kernel: sys_munmap NOT IMPLEMENTED YET!");
+    if _start % PAGE_SIZE != 0{
+        return -1;
+    }
+    let mut curvad = _start;
+    let _end = _start + ((_len + PAGE_SIZE - 1) & !(PAGE_SIZE-1));
+    while curvad < _end{
+        let pte = PageTable::from_token(current_user_token()).translate(VirtAddr::from(curvad).floor());
+        if let Option::Some(_pte) = pte{
+            if !_pte.is_valid() {
+                return -1;
+            }
+        }else{
+            return -1;
+        }
+        curvad += PAGE_SIZE;
+    }
+    erase_from_current_memoryset(VirtAddr::from(_start), VirtAddr::from(_end));
+    0
 }
 
 /// change data segment size
@@ -148,7 +201,25 @@ pub fn sys_spawn(_path: *const u8) -> isize {
         "kernel:pid[{}] sys_spawn NOT IMPLEMENTED",
         current_task().unwrap().pid.0
     );
-    -1
+    let token = current_user_token();
+    let path = translated_str(token, _path);
+    if let Some(data) = get_app_data_by_name(path.as_str()) {
+        let newtask = Arc::new(TaskControlBlock::new(data));
+        let curtask = current_task().unwrap();
+        let childpid = newtask.getpid();
+        {
+            let mut parent_inner = curtask.inner_exclusive_access();
+            parent_inner.children.push(newtask.clone());
+        }
+        {
+            let mut child_inner = newtask.inner_exclusive_access();
+            child_inner.parent = Some(Arc::downgrade(&curtask));
+        }
+        add_task(newtask);
+        childpid as isize
+    } else {
+        -1
+    }
 }
 
 // YOUR JOB: Set task priority.
@@ -157,5 +228,13 @@ pub fn sys_set_priority(_prio: isize) -> isize {
         "kernel:pid[{}] sys_set_priority NOT IMPLEMENTED",
         current_task().unwrap().pid.0
     );
-    -1
+    if _prio <= 1 {
+        -1
+    }
+    else{
+        let task = current_task().unwrap();
+        let mut inner = task.inner_exclusive_access();
+        inner.priority = _prio as u64;
+        _prio
+    }
 }
